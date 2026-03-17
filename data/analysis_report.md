@@ -341,4 +341,199 @@ data/
 
 ---
 
-*报告生成于 2026-03-17，基于 HuggingFace 公开数据分析。*
+## 十三、NeMo Gym Reward 计算机制深度分析
+
+> 基于 NeMo Gym 源码 (`github.com/NVIDIA-NeMo/Gym`) 的实际实现分析。
+
+### 13.1 三服务器架构
+
+NeMo Gym 采用三服务器架构运行 RL 训练：
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────────────────────────────────────┐
+│ Agent Server │────▶│ Model Server │     │ Resources Server                             │
+│ (编排)        │     │ (LLM 推理)   │     │ single_step_tool_use_with_argument_comparison │
+│              │◀────│              │     │ (提供工具定义 + 计算 reward)                    │
+│              │────────────────────────▶│ /verify 端点                                  │
+└──────────────┘                         └──────────────────────────────────────────────┘
+```
+
+流程：
+1. Agent Server 把 `responses_create_params` 发给 Model Server → 模型生成输出
+2. Agent Server 把 `{模型输出, expected_action}` 发给 Resources Server 的 `/verify`
+3. Resources Server 返回 `{reward, category}`
+
+### 13.2 核心发现："Pivot" 是伪多轮，每条样本只推理一步
+
+**这是理解这两个数据集最关键的一点。**
+
+"Pivot"（透视）指的是**数据准备策略**：将完整的多轮专家轨迹拆解为 N 个独立的单步决策问题。每条训练样本中的 `responses_create_params.input` 已经包含了从对话开始到当前决策点的**完整历史**（来自预录制的专家轨迹），模型只需要预测**下一个 action**。
+
+#### 源码证据：`tool_simulation_agent` 只调用模型一次
+
+```python
+# responses_api_agents/tool_simulation_agent/app.py
+async def run(self, body):
+    # 第1步：调用模型一次，没有循环
+    response = await self.server_client.post(
+        server_name=config.name,
+        url_path="/v1/responses",
+        json=body.responses_create_params,   # 完整历史作为输入
+    )
+
+    # 第2步：直接验证，返回 reward，结束
+    verify_response = await self.server_client.post(
+        server_name=config.resources_server.name,
+        url_path="/verify",
+        json={responses_create_params, response, expected_action},
+    )
+    return verify_response  # reward: 0 or 1
+```
+
+**没有 while 循环，没有工具模拟执行，没有继续对话。** 对比 NeMo Gym 中真正的多轮 Agent（`simple_agent`）：
+
+```python
+# simple_agent/app.py — 真正的多轮 rollout
+while True:
+    response = call_model(...)
+    if has_tool_call(response):
+        tool_result = execute_tool(response)  # 模拟执行工具
+        history.append(tool_result)           # 加入历史
+        continue                              # 继续循环
+    else:
+        break
+```
+
+#### 具体示例：turn=5, step=2 的训练样本
+
+```
+专家轨迹（离线预录制）:
+  turn 1: user → [assistant 调 tool_A] → tool_A 返回 → assistant 回复
+  turn 2: user → [assistant 调 tool_B] → tool_B 返回 → assistant 回复
+  turn 3: user → [assistant 回复]
+  turn 4: user → [assistant 调 tool_C] → tool_C 返回 → assistant 回复
+  turn 5: user → [assistant 调 tool_D] → tool_D 返回 → [assistant 调 tool_E]
+                                                        ↑ step=2，要预测的点
+
+Pivot 拆解后的训练样本：
+┌──────────────────────────────────────────────────────────┐
+│ input: turn1~turn5 完整历史（含所有工具调用和返回值）         │
+│        + turn5 step1 的 tool_D 调用和返回值                │
+│        （全部来自专家轨迹，预先录制好的）                     │
+│                                                          │
+│ RL rollout: 模型只需预测一个 action                       │
+│                                                          │
+│ expected_action: function_call → tool_E(args...)          │
+│ reward: 模型输出 vs expected_action → 0 或 1               │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### 多轮(turn) vs 多步(step) 的含义
+
+- **Turn（轮）**= 用户发了一条新消息，每次用户说话开启一个新 turn
+- **Step（步）**= 助手在同一轮里的第几次动作（先调工具 A → 再调工具 B → 最后回复）
+- **Depth** = 全局累计深度，整个对话中助手已执行的动作总数
+
+#### 为什么采用 Pivot 单步方案
+
+```
+传统多轮 RL rollout 的问题：
+  ├── 需要模拟工具执行环境（复杂、不通用）
+  ├── 错误累积：turn 1 错了，后面全错（稀疏奖励）
+  ├── 长轨迹的信用分配困难
+  └── 计算成本高（一条轨迹要推理 N 次）
+
+Pivot 单步方案的优势：
+  ├── 不需要工具模拟器（历史中工具返回值是预录的）
+  ├── 每步独立评估，避免错误累积
+  ├── 信用分配简单（一个 action 对应一个 reward）
+  ├── 高度并行（所有样本独立，可大规模 batch）
+  └── 本质是"用 RL 框架（GRPO）做行为克隆"
+```
+
+### 13.3 Reward 判定逻辑（两个数据集共用）
+
+核心代码在 `resources_servers/single_step_tool_use_with_argument_comparison/app.py`。
+
+#### 判定矩阵（二值奖励，只有 0 和 1，无部分得分）
+
+| 期望动作 | 模型输出 | Reward | Category |
+|---------|---------|--------|----------|
+| function_call | function_call（匹配） | **1.0** | `EXPECTED_TOOL_CALL` |
+| function_call | function_call（工具名错） | 0.0 | `UNEXPECTED_TOOL` |
+| function_call | function_call（参数错） | 0.0 | `ARGUMENT_VALUE_DIFFERENT` 等 |
+| function_call | message | 0.0 | `NO_EXPECTED_TOOL_CALL` |
+| function_call | 无输出 | 0.0 | `NO_ACTION_FOUND` |
+| **message** | **message（任意内容）** | **1.0** | `EXPECTED_CHAT_MESSAGE_FOUND` |
+| message | function_call | 0.0 | `NO_EXPECTED_CHAT_MESSAGE` |
+
+**重要**：当期望是 message 时，只要模型选择了"回复文本"而非"调用工具"，就直接给 1.0，**完全不比较回复内容是否正确**。Reward 只衡量"动作类型选择 + 工具调用准确性"。
+
+### 13.4 函数调用参数比较规则 (`ToolCallComparator`)
+
+参数比较是递归、类型感知的：
+
+```
+1. 工具名 → 精确匹配，错了直接 0.0
+2. 参数 JSON 解析 → 解析失败直接 0.0
+3. 逐个参数递归比较：
+   ├── dict:      key 集合必须完全相同，然后递归比较每个 value
+   ├── list:      长度必须相同，然后逐元素递归比较
+   ├── int/bool/None: 精确相等
+   ├── float:     容差 1e-6 内算匹配
+   └── string:    见下方特殊规则
+```
+
+**字符串比较（唯一的"模糊"部分）**：
+
+- 单词数 < 2 → 精确匹配
+- 单词数 >= 2 → Jaccard 词频相似度
+
+```
+相似度 = 交集词数 / (期望总词数 + 实际总词数)
+```
+
+两个数据集的字符串匹配阈值均为 **0.1**（非常宽松）。例如 `"Birds are animals."` vs `"The birds fly."` → 交集=1, 总=6, 相似度=0.167 > 0.1 → 通过。
+
+### 13.5 两个数据集的 Reward 差异
+
+| | Function-Calling-Pivot | Conversational-Tool-Use-Pivot |
+|---|---|---|
+| Reward 验证逻辑 | 完全相同（同一个 Resources Server） | 完全相同 |
+| Agent 配置名 | `toolcall_schema_*_agent` | `single_step_*_agent` |
+| 字符串匹配阈值 | 0.1 | 0.1 |
+| **数据集内预计算 reward** | **无** | **有** (`qwen_235b_info`) |
+| Reward 来源 | 训练时由 NeMo Gym 在线计算 | 既有预计算的，也可在线重算 |
+
+#### Conversational-Tool-Use 的预计算 reward
+
+`qwen_235b_info` 是用 Qwen-235B 模型**多次采样**后，对每次采样结果用同样的 verify 逻辑打分得到的预计算统计量。配合 `pass_rate` 字段，提供了该决策点的难度信号，可用于：
+
+- **课程学习**（curriculum learning）：按难度排序训练
+- **数据筛选**：过滤掉太难或太简单的样本
+- **离线 RL**：直接使用预计算奖励而不需要在线推理
+
+### 13.6 Reward 流向 GRPO
+
+在 NeMo RL 中（`nemo_rl/experience/rollouts.py`），verify 返回的单个 reward 标量直接作为 GRPO 的奖励信号：
+
+```python
+"total_reward": torch.tensor([r["full_result"]["reward"] for r in results])
+```
+
+GRPO 使用这个 per-sample reward 进行优势估计和策略优化，没有轨迹级别的奖励聚合或折扣。
+
+### 13.7 本质总结
+
+**这两个 Pivot 数据集本质上是"用 GRPO/RLVR 框架做行为克隆"**：
+
+- 专家轨迹被拆解为独立的 (state, action) 对
+- state = 完整对话历史（预录制），action = 下一步操作
+- 每个样本是独立的单步决策问题
+- 模型只推理一次，预测一个 action
+- Reward 只比较这一个 action 是否与专家一致（0 或 1）
+- 不存在真正的多轮 rollout 或工具执行模拟
+
+---
+
+*报告更新于 2026-03-17，新增 NeMo Gym 源码级 Reward 机制分析。*
